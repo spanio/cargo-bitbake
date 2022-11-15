@@ -383,7 +383,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         .truncate(true)
         .open(&recipe_inc_path)
         // CliResult accepts only failure::Error, not failure::Context
-        .map_err(|e| format_err!("Unable to open bitbake recipe inc file with: {}", e))?;
+        .map_err(|e| anyhow::format_err!("Unable to open bitbake recipe inc file with: {}", e))?;
 
     // Write the contents out
     write!(
@@ -391,7 +391,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         include_str!("bitbake_inc.template"),
         src_uri = src_uris.join(""),
     )
-    .map_err(|e| format_err!("Unable to write to bitbake recipe inc file with: {}", e))?;
+    .map_err(|e| anyhow::format_err!("Unable to write to bitbake recipe inc file with: {}", e))?;
 
     println!("Wrote: {}", recipe_inc_path.display());
 
