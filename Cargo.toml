@@ -10,7 +10,7 @@ edition = "2018"
 name = "cargo-bitbake"
 readme = "README.md"
 repository = "https://github.com/cardoe/cargo-bitbake"
-version = "0.3.15-alpha.0"
+version = "0.3.16-alpha.0"
 
 [badges]
 is-it-maintained-issue-resolution = { repository = "cardoe/cargo-bitbake" }
@@ -21,11 +21,11 @@ maintenance = { status = "passively-maintained" }
 repository = "cardoe/cargo-bitbake"
 
 [dependencies]
-cargo = "^0.41"
-git2 = "0.10"
-itertools = "^0.5.0"
+anyhow = "^1.0"
+cargo = "^0.61"
+git2 = "0.14"
+itertools = "^0.10"
 lazy_static = "^1"
-md5 = "^0.3"
+md5 = "^0.7"
 regex = "^1"
 structopt = "^0.3"
-failure = "0.1"
