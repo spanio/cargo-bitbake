@@ -8,30 +8,30 @@
  * except according to those terms.
  */
 
+extern crate anyhow;
 extern crate cargo;
-extern crate itertools;
-#[macro_use]
-extern crate lazy_static;
-extern crate failure;
 extern crate git2;
+extern crate itertools;
+extern crate lazy_static;
 extern crate md5;
 extern crate regex;
 extern crate structopt;
 
+use anyhow::{anyhow, Context as _};
 use cargo::core::registry::PackageRegistry;
-use cargo::core::resolver::ResolveOpts;
+use cargo::core::resolver::features::HasDevUnits;
+use cargo::core::resolver::CliFeatures;
 use cargo::core::source::GitReference;
 use cargo::core::{Package, PackageSet, Resolve, Workspace};
 use cargo::ops;
-use cargo::util::{important_paths, CargoResult, CargoResultExt};
+use cargo::util::{important_paths, CargoResult};
 use cargo::{CliResult, Config};
-use failure::{err_msg, format_err};
 use itertools::Itertools;
 use std::default::Default;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use structopt::clap::AppSettings;
 use structopt::StructOpt;
 
@@ -48,12 +48,10 @@ struct PackageInfo<'cfg> {
 }
 
 impl<'cfg> PackageInfo<'cfg> {
-    /// creates our package info from the config and the manifest_path,
+    /// creates our package info from the config and the `manifest_path`,
     /// which may not be provided
     fn new(config: &Config, manifest_path: Option<String>) -> CargoResult<PackageInfo> {
-        let manifest_path = manifest_path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.cwd().to_path_buf());
+        let manifest_path = manifest_path.map_or_else(|| config.cwd().to_path_buf(), PathBuf::from);
         let root = important_paths::find_root_manifest_for_wd(&manifest_path)?;
         let ws = Workspace::new(&root, config)?;
         Ok(PackageInfo {
@@ -90,7 +88,8 @@ impl<'cfg> PackageInfo<'cfg> {
             &mut registry,
             &self.ws,
             /* resolve it all */
-            ResolveOpts::everything(),
+            &CliFeatures::new_all(true),
+            HasDevUnits::No,
             /* previous */
             Some(&resolve),
             /* don't avoid any */
@@ -112,16 +111,15 @@ impl<'cfg> PackageInfo<'cfg> {
         let root = self.ws.root().to_path_buf();
         // path where our current package's Cargo.toml lives
         let cwd = self.current_manifest.parent().ok_or_else(|| {
-            format_err!(
+            anyhow!(
                 "Could not get parent of directory '{}'",
                 self.current_manifest.display()
             )
         })?;
 
-        Ok(cwd
-            .strip_prefix(&root)
-            .map(|p| p.to_path_buf())
-            .chain_err(|| err_msg("Unable to if Cargo.toml is in a sub directory"))?)
+        cwd.strip_prefix(&root)
+            .map(Path::to_path_buf)
+            .context("Unable to if Cargo.toml is in a sub directory")
     }
 }
 
@@ -134,8 +132,17 @@ struct Args {
     /// Verbose mode (-v, -vv, -vvv, etc.)
     #[structopt(short = "v", parse(from_occurrences))]
     verbose: usize,
+
+    /// Reproducible mode: Output exact git references for git projects
+    #[structopt(short = "R")]
+    reproducible: bool,
+
+    /// Legacy Overrides: Use legacy override syntax
+    #[structopt(short = "l", long = "--legacy-overrides")]
+    legacy_overrides: bool,
 }
 
+#[derive(StructOpt, Debug)]
 #[structopt(
     name = "cargo-bitbake",
     bin_name = "cargo",
@@ -143,7 +150,6 @@ struct Args {
     about = "Generates a BitBake recipe for a given Cargo project",
     global_settings(&[AppSettings::ColoredHelp])
 )]
-#[derive(StructOpt, Debug)]
 enum Opt {
     /// Generates a BitBake recipe for a given Cargo project
     #[structopt(name = "bitbake")]
@@ -162,9 +168,9 @@ fn main() {
 fn real_main(options: Args, config: &mut Config) -> CliResult {
     config.configure(
         options.verbose as u32,
-        Some(options.quiet),
+        options.quiet,
         /* color */
-        &None,
+        None,
         /* frozen */
         false,
         /* locked */
@@ -174,6 +180,8 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         /* target dir */
         &None,
         /* unstable flags */
+        &[],
+        /* CLI config */
         &[],
     )?;
 
@@ -187,7 +195,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         .parent()
         .expect("Cargo.toml must have a parent");
 
-    if package.name().contains("_") {
+    if package.name().contains('_') {
         println!("Package name contains an underscore");
     }
 
@@ -229,14 +237,39 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
 
                 // save revision
                 src_uri_extras.push(format!("SRCREV_FORMAT .= \"_{}\"", pkg.name()));
-                let rev = match *src_id.git_reference()? {
-                    GitReference::Tag(ref s) | GitReference::Rev(ref s) => s.to_owned(),
-                    GitReference::Branch(ref s) => {
-                        if s == "master" {
-                            String::from("${AUTOREV}")
-                        } else {
-                            s.to_owned()
+
+                let precise = if options.reproducible {
+                    src_id.precise()
+                } else {
+                    None
+                };
+
+                let rev = if let Some(precise) = precise {
+                    precise
+                } else {
+                    match *src_id.git_reference()? {
+                        GitReference::Tag(ref s) => s,
+                        GitReference::Rev(ref s) => {
+                            if s.len() == 40 {
+                                // avoid reduced hashes
+                                s
+                            } else {
+                                let precise = src_id.precise();
+                                if let Some(p) = precise {
+                                    p
+                                } else {
+                                    panic!("cannot find rev in correct format!");
+                                }
+                            }
                         }
+                        GitReference::Branch(ref s) => {
+                            if s == "master" {
+                                "${AUTOREV}"
+                            } else {
+                                s
+                            }
+                        }
+                        GitReference::DefaultBranch => "${AUTOREV}",
                     }
                 };
 
@@ -249,7 +282,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
 
                 Some(format!("    {} \\\n", url))
             } else {
-                Some(format!("    {} \\\n", src_id.url().to_string()))
+                Some(format!("    {} \\\n", src_id.url()))
             }
         })
         .collect::<Vec<String>>();
@@ -266,7 +299,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
             println!("No package.description set in your Cargo.toml, using package.name");
             package.name()
         },
-        |s| cargo::core::InternedString::new(s.trim()),
+        |s| cargo::util::interning::InternedString::new(&s.trim().replace("\n", " \\\n")),
     );
 
     // package homepage (or source code location)
@@ -279,9 +312,9 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
                 metadata
                     .repository
                     .as_ref()
-                    .ok_or_else(|| err_msg("No package.repository set in your Cargo.toml"))
+                    .ok_or_else(|| anyhow!("No package.repository set in your Cargo.toml"))
             },
-            |s| Ok(s),
+            Ok,
         )?
         .trim();
 
@@ -295,10 +328,10 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
                     println!("Assuming {} license", license::CLOSED_LICENSE);
                     license::CLOSED_LICENSE
                 },
-                |s| s.as_str(),
+                String::as_str,
             )
         },
-        |s| s.as_str(),
+        String::as_str,
     );
 
     // compute the relative directory into the repo our Cargo.toml is at
@@ -316,7 +349,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
     }
 
     // license data in Yocto fmt
-    let license = license.split('/').map(|f| f.trim()).join(" | ");
+    let license = license.split('/').map(str::trim).join(" | ");
 
     // attempt to figure out the git repo for this project
     let project_repo = git::ProjectRepo::new(config).unwrap_or_else(|e| {
@@ -326,16 +359,18 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
 
     // if this is not a tag we need to include some data about the version in PV so that
     // the sstate cache remains valid
-    let git_srcpv = if project_repo.tag && project_repo.rev.len() > 10 {
-        // its a tag so nothing needed
-        "".into()
-    } else {
+    let git_srcpv = if !project_repo.tag && project_repo.rev.len() > 10 {
+        let mut pv_append_key = "PV:append";
+        // Override PV override with legacy syntax if flagged
+        if options.legacy_overrides {
+            pv_append_key = "PV_append";
+        }
         // we should be using ${SRCPV} here but due to a bitbake bug we cannot. see:
         // https://github.com/meta-rust/meta-rust/issues/136
-        format!(
-            "PV_append = \".AUTOINC+{}\"",
-            project_repo.rev.split_at(10).0
-        )
+        format!("{} = \".AUTOINC+{}\"", pv_append_key, &project_repo.rev[..10])
+    } else {
+        // its a tag so nothing needed
+        "".into()
     };
 
     // Build up the recipe inc path
@@ -348,7 +383,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         .truncate(true)
         .open(&recipe_inc_path)
         // CliResult accepts only failure::Error, not failure::Context
-        .map_err(|e| format_err!("Unable to open bitbake recipe inc file with: {}", e))?;
+        .map_err(|e| anyhow::format_err!("Unable to open bitbake recipe inc file with: {}", e))?;
 
     // Write the contents out
     write!(
@@ -356,7 +391,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         include_str!("bitbake_inc.template"),
         src_uri = src_uris.join(""),
     )
-    .map_err(|e| format_err!("Unable to write to bitbake recipe inc file with: {}", e))?;
+    .map_err(|e| anyhow::format_err!("Unable to write to bitbake recipe inc file with: {}", e))?;
 
     println!("Wrote: {}", recipe_inc_path.display());
 
@@ -370,7 +405,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         .truncate(true)
         .open(&recipe_path)
         // CliResult accepts only failure::Error, not failure::Context
-        .map_err(|e| format_err!("Unable to open bitbake recipe file with: {}", e))?;
+        .map_err(|e| anyhow!("Unable to open bitbake recipe file with: {}", e))?;
 
     // write the contents out
     write!(
@@ -390,7 +425,7 @@ fn real_main(options: Args, config: &mut Config) -> CliResult {
         git_srcpv = git_srcpv,
         cargo_bitbake_ver = env!("CARGO_PKG_VERSION"),
     )
-    .map_err(|e| format_err!("Unable to write to bitbake recipe file with: {}", e))?;
+    .map_err(|e| anyhow!("Unable to write to bitbake recipe file with: {}", e))?;
 
     println!("Wrote: {}", recipe_path.display());
 

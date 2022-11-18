@@ -8,10 +8,11 @@
  * except according to those terms.
  */
 
-use cargo::util::{CargoResult, CargoResultExt};
+use anyhow::{anyhow, Context as _};
+use cargo::util::CargoResult;
 use cargo::Config;
-use failure::err_msg;
 use git2::{self, Repository};
+use lazy_static::lazy_static;
 use regex::Regex;
 use std::default::Default;
 use std::fmt::{self, Display};
@@ -32,8 +33,8 @@ pub enum GitPrefix {
 }
 
 impl Default for GitPrefix {
-    fn default() -> GitPrefix {
-        GitPrefix::Git
+    fn default() -> Self {
+        Self::Git
     }
 }
 
@@ -66,10 +67,10 @@ pub fn git_to_yocto_git_url(url: &str, name: Option<&str>, prefix: GitPrefix) ->
     // and append metadata necessary for Yocto to generate
     // data for Cargo to understand
     let yocto_url = match fixed_url.split_at(fixed_url.find(':').unwrap()) {
-        (proto @ "ssh", rest) | (proto @ "http", rest) | (proto @ "https", rest) => {
+        (proto @ ("ssh" | "http" | "https"), rest) => {
             format!("{}{};protocol={}", prefix, rest, proto)
         }
-        (_, _) => fixed_url.to_owned(),
+        (_, _) => fixed_url,
     };
 
     // by default bitbake only look for SHAs and refs on the master branch.
@@ -92,17 +93,17 @@ pub struct ProjectRepo {
 
 impl ProjectRepo {
     /// Attempts to guess at the upstream repo this project can be fetched from
-    pub fn new(config: &Config) -> CargoResult<ProjectRepo> {
+    pub fn new(config: &Config) -> CargoResult<Self> {
         let repo = Repository::discover(config.cwd())
-            .chain_err(|| "Unable to determine git repo for this project")?;
+            .context("Unable to determine git repo for this project")?;
 
         let remote = repo
             .find_remote("origin")
-            .chain_err(|| "Unable to find remote 'origin' for this project")?;
+            .context("Unable to find remote 'origin' for this project")?;
 
         let submodules = repo
             .submodules()
-            .chain_err(|| "Unable to determine the submodules")?;
+            .context("Unable to determine the submodules")?;
         let prefix = if submodules.is_empty() {
             GitPrefix::Git
         } else {
@@ -111,13 +112,13 @@ impl ProjectRepo {
 
         let uri = remote
             .url()
-            .ok_or_else(|| err_msg("No URL for remote 'origin'"))?;
+            .ok_or_else(|| anyhow!("No URL for remote 'origin'"))?;
         let uri = git_to_yocto_git_url(uri, None, prefix);
 
-        let head = repo.head().chain_err(|| "Unable to find HEAD")?;
+        let head = repo.head().context("Unable to find HEAD")?;
         let branch = head
             .shorthand()
-            .ok_or_else(|| err_msg("Unable resolve HEAD to a branch"))?;
+            .ok_or_else(|| anyhow!("Unable resolve HEAD to a branch"))?;
 
         // if the branch is master or HEAD we don't want it
         let uri = if branch == "master" || branch == "HEAD" {
@@ -128,9 +129,9 @@ impl ProjectRepo {
 
         let rev = head
             .target()
-            .ok_or_else(|| err_msg("Unable to resolve HEAD to a commit"))?;
+            .ok_or_else(|| anyhow!("Unable to resolve HEAD to a commit"))?;
 
-        Ok(ProjectRepo {
+        Ok(Self {
             uri,
             branch: branch.to_string(),
             rev: rev.to_string(),
@@ -149,7 +150,7 @@ impl ProjectRepo {
         // walk through all the tags and resolve them to their commitish
         // return true if we find a tag that matches our revision
         tags.iter()
-            .filter_map(|tag| tag)
+            .flatten()
             .filter_map(|tag| repo.revparse_single(tag).ok())
             .filter_map(|tag| tag.peel(git2::ObjectType::Commit).ok())
             .any(|t| t.id() == *rev)
